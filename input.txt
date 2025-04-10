@@ -1,2 +1,0 @@
-https://en.wikipedia.org/wiki/List_of_World_Heritage_Sites_in_India -o output -f json -n india_heritage_sites
-https://en.wikipedia.org/wiki/Land_use -o output -f csv -n land_use
