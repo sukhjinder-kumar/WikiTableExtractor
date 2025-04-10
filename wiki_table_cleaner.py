@@ -10,7 +10,8 @@ import os
 import json
 import logging
 from urllib.parse import urlparse, urljoin
-import io # Needed for read_html from string
+import io  # Needed for read_html from string
+import shlex
 
 # --- Configuration ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -35,7 +36,7 @@ def clean_text(text):
     if text is None:
         return None
     # Remove footnote references like [1], [a], etc.
-    text = re.sub(r'\[[^\]]+\]', '', str(text)) # Ensure text is string
+    text = re.sub(r'\[[^\]]+\]', '', str(text))  # Ensure text is string
     # Strip leading/trailing whitespace
     text = text.strip()
     # Replace common 'empty' markers with None (pandas handles NaN)
@@ -68,7 +69,7 @@ def clean_dataframe(df):
     if df is None or df.empty:
         return df
 
-    # 1. pd.read_html often creates multi-level headers for colspan/rowspan.
+    # 1. Flatten MultiIndex columns if present
     #    We can flatten them or handle them as needed.
     #    Simple flattening: Join levels with a space
     if isinstance(df.columns, pd.MultiIndex):
@@ -79,7 +80,7 @@ def clean_dataframe(df):
     #    (read_html might handle some, but good to be thorough)
     df.replace(['—', '–', 'N/A', 'n/a', ''], pd.NA, inplace=True)
 
-    # 3. Attempt numeric conversion (handle potential commas, symbols)
+    # 3. Attempt numeric conversion
     for col in df.columns:
         # Make a copy to attempt conversion
         original_col = df[col]
@@ -91,24 +92,22 @@ def clean_dataframe(df):
 
             # Only assign back if conversion resulted in at least one number
             # and didn't convert everything to NaN (unless original was mostly non-numeric markers)
-            if numeric_col.notna().any(): # or not original_col.isin(['—', '–', 'N/A', 'n/a', '', None]).all() :
-                 df[col] = numeric_col
-                 logging.debug(f"Attempted numeric conversion on column '{col}'.")
+            if numeric_col.notna().any():  # or not original_col.isin(['—', '–', 'N/A', 'n/a', '', None]).all() :
+                df[col] = numeric_col
+                logging.debug(f"Attempted numeric conversion on column '{col}'.")
             else:
-                logging.debug(f"Column '{col}' kept as object after failed numeric conversion attempt.")
+                logging.debug(f"Column '{col}' kept as object after numeric conversion attempt.")
 
+        except Exception as e:
+            logging.debug(f"Could not convert column '{col}': {e}")
+            pass
 
-        except (AttributeError, TypeError, ValueError, Exception) as e:
-             logging.debug(f"Could not attempt numeric conversion on column '{col}': {e}")
-             pass # Keep original data type
-
-    # 4. Drop rows/columns that are *entirely* NaN AFTER cleaning/conversion
+    # 4. Drop rows/columns that are entirely NaN
     df.dropna(how='all', axis=0, inplace=True)
     df.dropna(how='all', axis=1, inplace=True)
 
     df.reset_index(drop=True, inplace=True)
     return df
-
 
 def save_output(df, metadata, base_filename, index, output_format):
     """Saves the DataFrame to the specified format (CSV or JSON)."""
@@ -122,7 +121,6 @@ def save_output(df, metadata, base_filename, index, output_format):
             # with open(meta_filename, 'w', encoding='utf-8') as f:
             #     json.dump(metadata, f, indent=4)
             # logging.info(f"Metadata for table {index + 1} saved to {meta_filename}")
-
         elif output_format == 'json':
             output_data = {
                 "metadata": metadata,
@@ -138,19 +136,8 @@ def save_output(df, metadata, base_filename, index, output_format):
     except Exception as e:
         logging.error(f"An unexpected error occurred during saving: {e}")
 
-# --- Main Execution Logic ---
-
-def main():
-    parser = argparse.ArgumentParser(description="Scrape and clean tables from a Wikipedia page using pandas.read_html.")
-    parser.add_argument("url", help="URL of the Wikipedia page")
-    parser.add_argument("-o", "--output-dir", default=".", help="Directory to save the output files (default: current directory)")
-    parser.add_argument("-f", "--format", choices=['csv', 'json'], default='csv', help="Output format (csv or json, default: csv)")
-    # Use dest to avoid conflict with 'class' keyword
-    parser.add_argument("-c", "--class", dest="css_class", default="wikitable", help="CSS class of the tables to scrape (default: 'wikitable')")
-    parser.add_argument("-n", "--name", help="Base name for output files (default: derived from URL)")
-
-    args = parser.parse_args()
-
+def process_page(args):
+    """Process a single page given the argparse Namespace with parameters."""
     # Validate URL
     parsed_url = urlparse(args.url)
     if not all([parsed_url.scheme, parsed_url.netloc]):
@@ -158,9 +145,8 @@ def main():
         return
 
     # Create output directory
-    os.makedirs(args.output_dir, exist_ok=True) # exist_ok=True prevents error if dir exists
+    os.makedirs(args.output_dir, exist_ok=True)
     logging.info(f"Output directory set to: {args.output_dir}")
-
 
     # Determine base filename
     if args.name:
@@ -175,76 +161,81 @@ def main():
     if not html_content:
         return
 
-    # --- Parsing using pandas.read_html ---
+    # --- Parse tables using pandas.read_html ---
     dataframes = []
     try:
-        # Use io.StringIO to read from the fetched HTML string
-        # Use attrs to filter by class (may need adjustment if class string has spaces)
-        # Using flavor='bs4' and specifying the parser explicitly
-        # Note: `attrs` expects exact match on the class attribute string.
-        # If you need to match *any* class from a list, it's more complex.
-        # For 'wikitable sortable', attrs={'class': 'wikitable sortable'} might be needed.
-        # Let's assume single class or exact match for now.
         logging.info(f"Attempting to parse tables with class '{args.css_class}' using pandas.read_html")
         dataframes = pd.read_html(io.StringIO(html_content),
                                   attrs={'class': args.css_class},
-                                  flavor='bs4', # Explicitly use BeautifulSoup
-                                  # header=0 # Often helpful, pd tries to auto-detect
-                                  )
-        logging.info(f"pandas.read_html found {len(dataframes)} table(s) matching class '{args.css_class}'.")
-
+                                  flavor='bs4')
+        logging.info(f"Found {len(dataframes)} table(s) matching class '{args.css_class}'.")
     except ValueError as e:
-        # ValueError is often raised by read_html if no tables are found matching criteria
-         logging.warning(f"pandas.read_html did not find any tables matching class '{args.css_class}'. Check class name and page source. Error: {e}")
-         # Optional: Try finding *any* table?
-         # try:
-         #    all_tables = pd.read_html(io.StringIO(html_content), flavor='bs4')
-         #    logging.info(f"Found {len(all_tables)} tables total on the page. No class filtering applied.")
-         # except ValueError:
-         #    logging.error("No tables found on the page at all.")
-         return # Exit if no tables found
+        logging.warning(f"No tables matching class '{args.css_class}' were found. Error: {e}")
+        return
     except Exception as e:
-        logging.error(f"An unexpected error occurred during pandas.read_html parsing: {e}")
+        logging.error(f"Unexpected error during parsing: {e}")
         return
 
-
-    # --- Extract Metadata using BeautifulSoup (Optional but recommended) ---
-    # We still parse with BS4 to get metadata elements like captions
+    # --- Extract Metadata using BeautifulSoup ---
     soup = BeautifulSoup(html_content, 'lxml')
-    # Find the same tables using BS4 to align metadata
     target_table_soups = soup.find_all('table', class_=args.css_class.split())
-
     if len(target_table_soups) != len(dataframes):
-        logging.warning(f"Mismatch between BeautifulSoup table count ({len(target_table_soups)}) and pandas.read_html count ({len(dataframes)}). Metadata association might be inaccurate.")
-        # Handle this case: maybe skip metadata or try a different association logic?
-        # For now, we'll proceed assuming the order matches.
+        logging.warning(f"Mismatch between BeautifulSoup ({len(target_table_soups)}) and pandas.read_html ({len(dataframes)}) table count. Proceeding with sequential pairing.")
 
     # --- Process and Save Each Table ---
     tables_processed_count = 0
-    # Use zip to iterate, assuming the order is consistent
     for i, (df, table_soup) in enumerate(zip(dataframes, target_table_soups)):
         logging.info(f"--- Processing Table {i + 1} ---")
-
-        # 1. Extract Metadata from the soup element
         metadata = extract_metadata(table_soup, args.url)
-
-        # 2. Clean the DataFrame obtained from read_html
-        cleaned_df = clean_dataframe(df.copy()) # Clean a copy
-
-        # 3. Save if valid
+        cleaned_df = clean_dataframe(df.copy())
         if cleaned_df is not None and not cleaned_df.empty:
             save_output(cleaned_df, metadata, base_filename, tables_processed_count, args.format)
             tables_processed_count += 1
         else:
-            logging.warning(f"Skipping Table {i + 1} after cleaning resulted in an empty DataFrame.")
+            logging.warning(f"Skipping Table {i + 1} as it resulted in an empty DataFrame after cleaning.")
 
-    logging.info(f"--- Finished ---")
-    if not dataframes and not target_table_soups:
-         logging.info(f"No tables matching class '{args.css_class}' were found to process.")
+    logging.info(f"Finished processing. {tables_processed_count} out of {len(dataframes)} table(s) were saved.")
+
+def create_arg_parser():
+    """Creates and returns the argument parser."""
+    parser = argparse.ArgumentParser(
+        description="Scrape and clean tables from a Wikipedia page using pandas.read_html. Supports single URL or batch processing."
+    )
+    # Positional URL is optional if batch_file is provided.
+    parser.add_argument("url", nargs="?", help="URL of the Wikipedia page")
+    parser.add_argument("-o", "--output-dir", default=".", help="Directory to save the output files (default: current directory)")
+    parser.add_argument("-f", "--format", choices=['csv', 'json'], default='csv', help="Output format (csv or json, default: csv)")
+    parser.add_argument("-c", "--class", dest="css_class", default="wikitable", help="CSS class of the tables to scrape (default: 'wikitable')")
+    parser.add_argument("-n", "--name", help="Base name for output files (default: derived from URL)")
+    # New option for batch processing
+    parser.add_argument("--batch-file", help="Path to a batch file with one URL (and flags) per line")
+    return parser
+
+def main():
+    parser = create_arg_parser()
+    args, remaining = parser.parse_known_args()
+
+    # If a batch file is specified, process each line from the file
+    if args.batch_file:
+        if not os.path.isfile(args.batch_file):
+            logging.error(f"Batch file not found: {args.batch_file}")
+            return
+        logging.info(f"Starting batch processing using file: {args.batch_file}")
+        with open(args.batch_file, 'r', encoding='utf-8') as f:
+            lines = [line.strip() for line in f if line.strip()]
+        for line in lines:
+            try:
+                # Parse each line as separate command-line arguments.
+                batch_args = parser.parse_args(shlex.split(line))
+                logging.info(f"Processing URL: {batch_args.url}")
+                process_page(batch_args)
+            except Exception as e:
+                logging.error(f"Error processing line: '{line}'. Exception: {e}")
+    elif args.url:
+        # Single URL mode
+        process_page(args)
     else:
-        logging.info(f"Successfully processed and saved {tables_processed_count} out of {len(dataframes)} found table(s).")
-
+        parser.error("Please provide either a URL or a --batch-file.")
 
 if __name__ == "__main__":
     main()
-
