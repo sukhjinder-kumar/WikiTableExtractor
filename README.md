@@ -32,4 +32,7 @@ To run the script, you need to have Python 3 installed along with the required l
 pip3 install requests pandas beautifulsoup4 lxml html5lib
 ```
 
-A sample script is `python3 wiki_table_cleaner.py https://en.wikipedia.org/wiki/List_of_World_Heritage_Sites_in_India -o output -f json -n india_heritage_sites`
+A sample script would be: 
+```bash
+python3 wiki_table_cleaner.py https://en.wikipedia.org/wiki/List_of_World_Heritage_Sites_in_India -o output -f json -n india_heritage_sites`
+```
